@@ -79,6 +79,11 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 		}
 		if resp.StatusCode != 200 && !uploadOnly {
 			errors.LogInfo(ctx, "unexpected status ", resp.StatusCode)
+			// Close response body on error to prevent memory leak
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			wrc.Close()
+			return
 		}
 		if resp.StatusCode != 200 || uploadOnly { // stream-up
 			io.Copy(io.Discard, resp.Body)
@@ -86,6 +91,8 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 			wrc.Close()
 			return
 		}
+		// For successful stream-down (status 200), transfer body ownership to WaitReadCloser
+		// WaitReadCloser will close it when done - no need to close here
 		wrc.(*WaitReadCloser).Set(resp.Body)
 	}()
 
@@ -144,11 +151,21 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 					resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
 					if err != nil {
 						c.closed = true
+						// Close connection on error to prevent leak
+						if h1UploadConn.Conn != nil {
+							h1UploadConn.Conn.Close()
+						}
 						return fmt.Errorf("error while reading response: %s", err.Error())
 					}
+					// Close response body immediately to prevent memory leak
+					// defer in loop would cause all defers to execute only at function end
 					io.Copy(io.Discard, resp.Body)
-					defer resp.Body.Close()
+					resp.Body.Close()
 					if resp.StatusCode != 200 {
+						// Close connection on error status
+						if h1UploadConn.Conn != nil {
+							h1UploadConn.Conn.Close()
+						}
 						return fmt.Errorf("got non-200 error response code: %d", resp.StatusCode)
 					}
 				}
@@ -162,11 +179,24 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 			if err == nil {
 				break
 			} else if newConnection {
+				// Close failed new connection to prevent leak
+				if h1UploadConn.Conn != nil {
+					h1UploadConn.Conn.Close()
+				}
 				return err
+			} else {
+				// Connection from pool failed, close it and try another
+				if h1UploadConn.Conn != nil {
+					h1UploadConn.Conn.Close()
+				}
+				uploadConn = nil // Don't put failed connection back in pool
 			}
 		}
 
-		c.uploadRawPool.Put(uploadConn)
+		// Only put connection back in pool if it's still valid
+		if uploadConn != nil {
+			c.uploadRawPool.Put(uploadConn)
+		}
 	}
 
 	return nil

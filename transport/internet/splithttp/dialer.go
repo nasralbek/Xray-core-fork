@@ -36,8 +36,10 @@ type dialerConf struct {
 }
 
 var (
-	globalDialerMap    map[dialerConf]*XmuxManager
-	globalDialerAccess sync.Mutex
+	globalDialerMap      map[dialerConf]*XmuxManager
+	globalDialerAccess   sync.Mutex
+	lastCleanupTime      time.Time
+	cleanupInterval      = 5 * time.Minute // Cleanup every 5 minutes
 )
 
 func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (DialerClient, *XmuxClient) {
@@ -69,6 +71,26 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 			return createHTTPClient(dest, streamSettings)
 		})
 		globalDialerMap[key] = xmuxManager
+	}
+
+	// Periodically cleanup unused managers to prevent memory leak
+	// Only run cleanup every cleanupInterval to avoid performance impact
+	now := time.Now()
+	if now.Sub(lastCleanupTime) > cleanupInterval {
+		lastCleanupTime = now
+		for k, m := range globalDialerMap {
+			hasActiveConnections := false
+			for _, client := range m.xmuxClients {
+				if !client.XmuxConn.IsClosed() && client.OpenUsage.Load() > 0 {
+					hasActiveConnections = true
+					break
+				}
+			}
+			// Remove managers with no active connections and no clients
+			if !hasActiveConnections && len(m.xmuxClients) == 0 {
+				delete(globalDialerMap, k)
+			}
+		}
 	}
 
 	xmuxClient := xmuxManager.GetXmuxClient(ctx)
